@@ -144,8 +144,10 @@ jobs:
         include:
           # Each arch on its own machine: the bundled Next.js server carries
           # native modules (sharp) for the machine that built it.
+          # macos-15, not macos-latest: on the macOS 26 image signing fails with
+          # EMFILE (too many open files) even with a raised ulimit.
           - arch: arm64
-            runner: macos-latest
+            runner: macos-15
           - arch: x64
             runner: macos-15-intel
     runs-on: ${{ matrix.runner }}
@@ -175,7 +177,9 @@ jobs:
       # the macOS runner's default limit (EMFILE: too many open files).
       - name: Package (unsigned)
         run: |
+          sudo launchctl limit maxfiles 65536 200000 || true
           ulimit -n 65536 || ulimit -n 10240
+          echo "open-file limit: $(ulimit -n) (system: $(launchctl limit maxfiles | tr -s ' '))"
           npx electron-builder --mac dmg zip --${{ matrix.arch }} --publish never -c.mac.identity=- -c.mac.hardenedRuntime=false -c.mac.notarize=false
       - uses: actions/upload-artifact@v4
         with:
