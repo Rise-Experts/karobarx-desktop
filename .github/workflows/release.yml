@@ -138,6 +138,8 @@ jobs:
     permissions:
       contents: read
     strategy:
+      # Let the other Mac build finish, so a failure in one is easy to see.
+      fail-fast: false
       matrix:
         include:
           # Each arch on its own machine: the bundled Next.js server carries
@@ -169,8 +171,12 @@ jobs:
       - run: npm run prepare:desktop
       # No Apple signing secrets here: ad-hoc signature, like the unsigned
       # KarobarX build (installed with install-mac.sh, self-swapping updates).
+      # The app has many small files (asar is off): signing opens more files than
+      # the macOS runner's default limit (EMFILE: too many open files).
       - name: Package (unsigned)
-        run: npx electron-builder --mac dmg zip --${{ matrix.arch }} --publish never -c.mac.identity=- -c.mac.hardenedRuntime=false -c.mac.notarize=false
+        run: |
+          ulimit -n 65536 || ulimit -n 10240
+          npx electron-builder --mac dmg zip --${{ matrix.arch }} --publish never -c.mac.identity=- -c.mac.hardenedRuntime=false -c.mac.notarize=false
       - uses: actions/upload-artifact@v4
         with:
           name: desktop-mac-${{ matrix.arch }}
