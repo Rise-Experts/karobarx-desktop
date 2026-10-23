@@ -1,0 +1,223 @@
+name: Build and publish release
+
+# Builds the KarobarX desktop app for Windows and macOS from the private
+# Rise-Experts/KarobarX source and publishes it as a release of THIS public
+# repository. Installed apps update from the latest release here.
+#
+# Started by:
+#   - KarobarX itself (repository_dispatch "karobarx-release") after CI passed
+#     on its main branch with a version that is not released yet;
+#   - hand: Actions -> Build and publish release -> Run workflow. With
+#     "publish" off it only builds (a test); on, it releases.
+# Never by pull requests or forks: no secret is ever exposed to outside code.
+#
+# Safety: the source is checked out with a READ-ONLY deploy key (secret
+# KAROBARX_SOURCE_KEY in the `release` environment, main branch only) and is
+# never committed, cached or uploaded. Only the installers and update files
+# are published. The release is written with this repository's own
+# GITHUB_TOKEN; no token with access to KarobarX can write anything.
+#
+# Configuration, `release` environment:
+#   secret    KAROBARX_SOURCE_KEY   private half of a read-only deploy key on
+#                                   Rise-Experts/KarobarX
+#   variables NEXT_PUBLIC_SUPABASE_URL, NEXT_PUBLIC_SUPABASE_ANON_KEY,
+#             NEXT_PUBLIC_SITE_URL  the production values the app talks to
+#             (public by design: they are inside every installer)
+
+on:
+  repository_dispatch:
+    types: [karobarx-release]
+  workflow_dispatch:
+    inputs:
+      ref:
+        description: KarobarX commit or branch to build
+        required: true
+        default: main
+      publish:
+        description: Publish the release (off = only build, as a test)
+        type: boolean
+        default: false
+
+permissions: {}
+
+concurrency:
+  group: release
+  cancel-in-progress: false
+
+env:
+  SOURCE_REPO: Rise-Experts/KarobarX
+
+jobs:
+  plan:
+    name: Check version
+    runs-on: ubuntu-latest
+    environment: release
+    permissions:
+      contents: read
+    outputs:
+      sha: ${{ steps.check.outputs.sha }}
+      version: ${{ steps.check.outputs.version }}
+      publish: ${{ steps.check.outputs.publish }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          repository: ${{ env.SOURCE_REPO }}
+          ref: ${{ github.event.client_payload.sha || inputs.ref }}
+          ssh-key: ${{ secrets.KAROBARX_SOURCE_KEY }}
+          persist-credentials: false
+          path: src
+      - id: check
+        env:
+          GH_TOKEN: ${{ github.token }}
+          PUBLISH: ${{ github.event_name == 'repository_dispatch' || inputs.publish }}
+          EXPECTED_VERSION: ${{ github.event.client_payload.version }}
+        run: |
+          version=$(node -p "require('./src/package.json').version")
+          sha=$(git -C src rev-parse HEAD)
+          if [ -n "$EXPECTED_VERSION" ] && [ "$EXPECTED_VERSION" != "$version" ]; then
+            echo "::error::KarobarX asked for v$EXPECTED_VERSION but commit $sha is v$version."; exit 1
+          fi
+          if gh release view "v$version" -R "$GITHUB_REPOSITORY" >/dev/null 2>&1; then
+            if [ "$PUBLISH" = "true" ]; then
+              echo "::error::v$version is already released. Raise \"version\" in KarobarX package.json to release an update."; exit 1
+            fi
+            echo "::notice::v$version is already released; building only."
+          fi
+          echo "sha=$sha" >> "$GITHUB_OUTPUT"
+          echo "version=$version" >> "$GITHUB_OUTPUT"
+          echo "publish=$PUBLISH" >> "$GITHUB_OUTPUT"
+          echo "Building KarobarX v$version from $sha (publish: $PUBLISH)."
+
+  build-windows:
+    name: Build Windows
+    needs: plan
+    runs-on: windows-latest
+    environment: release
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          repository: ${{ env.SOURCE_REPO }}
+          ref: ${{ needs.plan.outputs.sha }}
+          ssh-key: ${{ secrets.KAROBARX_SOURCE_KEY }}
+          persist-credentials: false
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+      - run: npm ci
+      # scripts/prepare-electron.cjs copies the NEXT_PUBLIC_* values from here.
+      - name: Write .env.local
+        shell: bash
+        env:
+          SUPABASE_URL: ${{ vars.NEXT_PUBLIC_SUPABASE_URL }}
+          SUPABASE_ANON_KEY: ${{ vars.NEXT_PUBLIC_SUPABASE_ANON_KEY }}
+          SITE_URL: ${{ vars.NEXT_PUBLIC_SITE_URL }}
+        run: |
+          printf 'NEXT_PUBLIC_SUPABASE_URL=%s\nNEXT_PUBLIC_SUPABASE_ANON_KEY=%s\nNEXT_PUBLIC_SITE_URL=%s\n' "$SUPABASE_URL" "$SUPABASE_ANON_KEY" "$SITE_URL" > .env.local
+      - run: npm run build
+      - run: npm run prepare:desktop
+      - name: Package
+        run: npx electron-builder --win nsis --x64 --publish never
+        env:
+          CSC_IDENTITY_AUTO_DISCOVERY: 'false'
+      - uses: actions/upload-artifact@v4
+        with:
+          name: desktop-win
+          if-no-files-found: error
+          retention-days: 3
+          path: |
+            dist/*.exe
+            dist/*.blockmap
+            dist/latest.yml
+
+  build-mac:
+    name: Build macOS (${{ matrix.arch }})
+    needs: plan
+    environment: release
+    permissions:
+      contents: read
+    strategy:
+      matrix:
+        include:
+          # Each arch on its own machine: the bundled Next.js server carries
+          # native modules (sharp) for the machine that built it.
+          - arch: arm64
+            runner: macos-latest
+          - arch: x64
+            runner: macos-15-intel
+    runs-on: ${{ matrix.runner }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          repository: ${{ env.SOURCE_REPO }}
+          ref: ${{ needs.plan.outputs.sha }}
+          ssh-key: ${{ secrets.KAROBARX_SOURCE_KEY }}
+          persist-credentials: false
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+      - run: npm ci
+      - name: Write .env.local
+        env:
+          SUPABASE_URL: ${{ vars.NEXT_PUBLIC_SUPABASE_URL }}
+          SUPABASE_ANON_KEY: ${{ vars.NEXT_PUBLIC_SUPABASE_ANON_KEY }}
+          SITE_URL: ${{ vars.NEXT_PUBLIC_SITE_URL }}
+        run: |
+          printf 'NEXT_PUBLIC_SUPABASE_URL=%s\nNEXT_PUBLIC_SUPABASE_ANON_KEY=%s\nNEXT_PUBLIC_SITE_URL=%s\n' "$SUPABASE_URL" "$SUPABASE_ANON_KEY" "$SITE_URL" > .env.local
+      - run: npm run build
+      - run: npm run prepare:desktop
+      # No Apple signing secrets here: ad-hoc signature, like the unsigned
+      # KarobarX build (installed with install-mac.sh, self-swapping updates).
+      - name: Package (unsigned)
+        run: npx electron-builder --mac dmg zip --${{ matrix.arch }} --publish never -c.mac.identity=- -c.mac.hardenedRuntime=false -c.mac.notarize=false
+      - uses: actions/upload-artifact@v4
+        with:
+          name: desktop-mac-${{ matrix.arch }}
+          if-no-files-found: error
+          retention-days: 3
+          path: |
+            dist/*.dmg
+            dist/*.zip
+            dist/*.blockmap
+            dist/latest-mac.yml
+
+  publish:
+    name: Publish release
+    needs: [plan, build-windows, build-mac]
+    if: needs.plan.outputs.publish == 'true'
+    runs-on: ubuntu-latest
+    environment: release
+    permissions:
+      contents: write
+    steps:
+      # Only for scripts/merge-mac-update-info.mjs and scripts/install-mac.sh.
+      - uses: actions/checkout@v4
+        with:
+          repository: ${{ env.SOURCE_REPO }}
+          ref: ${{ needs.plan.outputs.sha }}
+          ssh-key: ${{ secrets.KAROBARX_SOURCE_KEY }}
+          persist-credentials: false
+          path: src
+      - uses: actions/download-artifact@v4
+        with:
+          path: artifacts
+      - name: Collect files
+        run: |
+          mkdir release
+          cp artifacts/desktop-win/* release/
+          for dir in artifacts/desktop-mac-*; do find "$dir" -type f ! -name latest-mac.yml -exec cp {} release/ \; ; done
+          node src/scripts/merge-mac-update-info.mjs release/latest-mac.yml artifacts/desktop-mac-*/latest-mac.yml
+          cp src/scripts/install-mac.sh release/
+          ls -la release
+      # A draft first: installed apps must not see the release before all its
+      # update files are uploaded.
+      - name: Create release
+        env:
+          GH_TOKEN: ${{ github.token }}
+          VERSION: ${{ needs.plan.outputs.version }}
+        run: |
+          gh release create "v$VERSION" release/* -R "$GITHUB_REPOSITORY" --draft \
+            --title "KarobarX $VERSION" \
+            --notes "KarobarX desktop $VERSION. Windows: KarobarX-Setup-$VERSION.exe. macOS: in Terminal run  curl -fsSL https://github.com/$GITHUB_REPOSITORY/releases/latest/download/install-mac.sh | bash  (or the .dmg for your Mac: arm64 = Apple silicon, x64 = Intel)."
+          gh release edit "v$VERSION" -R "$GITHUB_REPOSITORY" --draft=false --latest
